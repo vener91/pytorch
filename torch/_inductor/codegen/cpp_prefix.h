@@ -16,7 +16,7 @@
 #include <c10/util/BFloat16-math.h>
 #include <c10/util/Half.h>
 
-#if defined(CPU_CAPABILITY_AVX512) || defined(CPU_CAPABILITY_AVX2)
+#if defined(CPU_CAPABILITY_AVX512) || defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_ZVECTOR)
 #define INDUCTOR_USE_VECTOR_TYPES() 1
 #else
 #define INDUCTOR_USE_VECTOR_TYPES() 0
@@ -246,7 +246,7 @@ inline float flag_to_float_scalar(T src) {
   return ret;
 }
 
-#if defined(CPU_CAPABILITY_AVX512) || defined(CPU_CAPABILITY_AVX2)
+#if defined(CPU_CAPABILITY_AVX512) || defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_ZVECTOR)
 
 inline at::vec::Vectorized<float> masked_load(const float* src, at::vec::Vectorized<float> mask) {
   at::vec::Vectorized<float> zero_vec(0);
@@ -356,6 +356,7 @@ inline at::vec::Vectorized<float> to_float_mask(at::vec::Vectorized<SRC> src) {
   return vec_convert_to_mask(src);
 }
 
+#if defined(CPU_CAPABILITY_AVX512) || defined(CPU_CAPABILITY_AVX2)
 template <>
 inline at::vec::Vectorized<float> to_float_mask(at::vec::Vectorized<int> src) {
 #if defined(CPU_CAPABILITY_AVX2)
@@ -364,6 +365,7 @@ inline at::vec::Vectorized<float> to_float_mask(at::vec::Vectorized<int> src) {
   return at::vec::Vectorized<float>(_mm512_castsi512_ps(src));
 #endif
 }
+#endif
 
 template <>
 inline at::vec::Vectorized<float> to_float_mask(at::vec::Vectorized<float> src) {
