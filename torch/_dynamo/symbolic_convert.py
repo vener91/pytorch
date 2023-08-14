@@ -1910,6 +1910,7 @@ class InstructionTranslatorBase(Checkpointable[InstructionTranslatorGraphState])
         )
         if name not in self.output.global_scope:
             self.output.install_global(name, value)
+
         return src
 
     @property
