@@ -1311,6 +1311,7 @@ class InstructionTranslatorBase(Checkpointable[InstructionTranslatorGraphState])
             unimplemented("missing: BUILD_SET")
         items = self.popn(inst.argval)
         options = VariableTracker.propagate(items)
+        items = set(map(HashableTracker, items))
         new_set = SetVariable(items, mutable_local=MutableLocal(), **options)
         self.push(new_set)
 
