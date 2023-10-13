@@ -58,6 +58,7 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
     The IR here has been normalized and functionalized.
     """
+    import ipdb; ipdb.set_trace()  # check if the graph is traced into
     if config.dce:
         # has some issues with mutation in inference mode
         gm.graph.eliminate_dead_code()
