@@ -442,6 +442,12 @@ class OutputAliasInfo:
     requires_grad: bool
 
 
+class InputType(Enum):
+    PARAMETER = 1
+    BUFFER = 2
+    USER_INPUT = 3
+
+
 # This class tells us info about user inputs.
 @dataclass(frozen=True)
 class InputAliasInfo:
@@ -449,6 +455,7 @@ class InputAliasInfo:
     mutates_data: bool
     mutates_metadata: bool
     requires_grad: bool
+    input_type: InputType
 
 
 @dataclasses.dataclass
@@ -566,15 +573,32 @@ class ViewAndMutationMeta:
     num_symints_saved_for_bw: Optional[int] = None
 
     def __post_init__(self):
-        mutated_inp_indices = [
-            i for i, m in enumerate(self.input_info) if m.mutates_metadata or m.mutates_data
-        ]
+        if self.keep_input_mutations and self.is_train:
+            mutated_inp_indices = [
+                i for i, m in enumerate(self.input_info) if (m.mutates_metadata or m.mutates_data) and m.input_type != InputType.BUFFER
+            ]
+        else:
+            mutated_inp_indices = [
+                i for i, m in enumerate(self.input_info) if (m.mutates_metadata or m.mutates_data)
+            ]
+
         # pre-compute the indices of the inputs that are mutated.
         # When keep_input_mutations is set, we don't need to worry about our epilogue
         # handling data-only mutations, because we keep them directly in the graph.
-        mutated_inp_runtime_indices = [
-            i for i, m in enumerate(self.input_info) if m.mutates_metadata or (not self.keep_input_mutations and m.mutates_data)
-        ]
+        if self.keep_input_mutations:
+            if self.is_train:
+                mutated_inp_runtime_indices = [
+                    i for i, m in enumerate(self.input_info) if (m.mutates_metadata or m.mutates_data) and m.input_type != InputType.BUFFER
+                ]
+            else:
+                mutated_inp_runtime_indices = [
+                    i for i, m in enumerate(self.input_info) if m.mutates_metadata
+                ]
+        else:
+            mutated_inp_runtime_indices = [
+                i for i, m in enumerate(self.input_info) if (m.mutates_metadata or m.mutates_data)
+            ]
+
         aliased_out_indices = [
             i
             for i, m in enumerate(self.output_info)
@@ -624,9 +648,15 @@ class ViewAndMutationMeta:
         self.num_outputs_aliased = (
             self.num_outputs_aliased_to_inputs + self.num_outputs_aliased_to_intermediates
         )
-        self.num_mutated_data_inputs = len(
-            [x for x in self.input_info if x.mutates_data]
-        )
+        if self.keep_input_mutations and self.is_train:
+            self.num_mutated_data_inputs = len(
+                [x for x in self.input_info if x.mutates_data and x.input_type != InputType.BUFFER]
+            )
+        else:
+            self.num_mutated_data_inputs = len(
+                [x for x in self.input_info if x.mutates_data]
+            )
+
         self.num_mutated_metadata_inputs = len(
             [
                 x
@@ -992,6 +1022,7 @@ def run_functionalized_fw_and_collect_metadata(
     keep_input_mutations: bool,
     # TODO: refactor to kill this flag
     is_train: bool = False,
+    num_params_buffers  = 0,
 ) -> ViewAndMutationMeta:
     memo = {}
 
@@ -1039,18 +1070,33 @@ def run_functionalized_fw_and_collect_metadata(
                     mutates_metadata = has_metadata_mutation(f_arg)
                 # Only track requires_grad info on *mutated* inputs,
                 # because they show up in the autograd.Function.forward as outputs
-                input_requires_grad_info.append(
-                    isinstance(f_arg, torch.Tensor) and f_arg.requires_grad
-                )
+                if keep_input_mutations and is_train:
+                    if i >= num_params_buffers:
+                        input_requires_grad_info.append(
+                            isinstance(f_arg, torch.Tensor) and f_arg.requires_grad
+                        )
+                else:
+                    input_requires_grad_info.append(
+                        isinstance(f_arg, torch.Tensor) and f_arg.requires_grad
+                    )
+
             else:
                 mutates_data = False
                 mutates_metadata = False
+
+            input_type = InputType.USER_INPUT
+            if i < num_params_buffers:
+                if arg.requires_grad:
+                    input_type = InputType.PARAMETER
+                else:
+                    input_type = InputType.BUFFER
 
             input_info.append(InputAliasInfo(
                 is_leaf=isinstance(arg, torch.Tensor) and safe_is_leaf(arg),
                 mutates_data=mutates_data,
                 mutates_metadata=mutates_metadata,
-                requires_grad=isinstance(f_arg, torch.Tensor) and f_arg.requires_grad
+                requires_grad=isinstance(f_arg, torch.Tensor) and f_arg.requires_grad,
+                input_type=input_type,
             ))
 
         # If a function involves creating a tensor, and returning a view of it, such that its _base is the intermediate,
@@ -1200,9 +1246,15 @@ def run_functionalized_fw_and_collect_metadata(
         # Our autograd.Function.forward returns both mutated inputs and outputs,
         # so we need grad info on all of them.
         requires_grad_info = input_requires_grad_info + output_requires_grad_info
-        assert len(requires_grad_info) == len(output_info) + len(
-            [x for x in input_info if x.mutates_data or x.mutates_metadata]
-        )
+
+        if keep_input_mutations and is_train:
+            assert len(requires_grad_info) == len(output_info) + len(
+                [x for x in input_info if (x.mutates_data or x.mutates_metadata) and x.input_type != InputType.BUFFER]
+            )
+        else:
+            assert len(requires_grad_info) == len(output_info) + len(
+                [x for x in input_info if (x.mutates_data or x.mutates_metadata)]
+            )
 
         # This analysis function returns *only* the outputs that are meant to be tangents to the backwards.
         # Anything that aliases (inputs returned in the fw due to metadata mutations, or outputs that alias inputs/intermediates)
@@ -1262,7 +1314,7 @@ def run_functionalized_fw_and_collect_metadata(
             subclass_inp_meta=create_subclass_meta(flat_args),
             subclass_fw_graph_out_meta=create_subclass_meta(fw_graph_outs),
             subclass_tangent_meta=create_subclass_meta(traced_tangents),
-            is_train=is_train,
+            is_train=is_train
         )
         return metadata
 
@@ -1439,6 +1491,8 @@ def maybe_to_fresh_input(idx, t, meta):
     if not isinstance(t, Tensor):
         return t
     if idx in meta.mutated_inp_indices:
+        if meta.is_train and meta.keep_input_mutations and meta.input_info[idx].input_type == InputType.BUFFER:
+            pass
         # We only need to bother cloning mutated inputs that participate in autograd.
         mutated_inp_idx = meta.mutated_inp_indices.index(idx)
         assert meta.input_info[idx].requires_grad == meta.requires_grad_info[mutated_inp_idx]
@@ -1502,11 +1556,20 @@ def fn_prepped_for_autograd(
         outs = list(outs)
         assert len(meta.output_info) == len(outs)
 
-        mutated_inputs_to_return = [
-            x
-            for (i, x) in enumerate(args_maybe_cloned)
-            if meta.input_info[i].mutates_metadata or meta.input_info[i].mutates_data
-        ]
+
+        if meta.is_train and meta.keep_input_mutations:
+            mutated_inputs_to_return = [
+                x
+                for (i, x) in enumerate(args_maybe_cloned)
+                # TODO what if buffer gets mutated metadata
+                if (meta.input_info[i].mutates_metadata or meta.input_info[i].mutates_data) and meta.input_info[i].input_type != InputType.BUFFER
+            ]
+        else:
+            mutated_inputs_to_return = [
+                x
+                for (i, x) in enumerate(args_maybe_cloned)
+                if (meta.input_info[i].mutates_metadata or meta.input_info[i].mutates_data)
+            ]
 
         intermediate_bases = []
         for i, (o, info) in enumerate(zip(outs, meta.output_info)):
@@ -1702,6 +1765,17 @@ def create_functionalized_fn(
                     assert inpt_new is not inpt_old
                     inpt_old.copy_(inpt_new)
 
+        if aot_config.keep_inference_input_mutations and trace_joint:
+            for i, (inpt_old, inpt_f) in enumerate(zip(args[0], f_args[0])):
+                if not isinstance(inpt_f, torch.Tensor):
+                    continue
+                assert is_fun(inpt_f)
+                inpt_new = from_fun(inpt_f)
+                if meta.input_info[i].mutates_data and not meta.input_info[i].mutates_metadata:
+                    if i < aot_config.num_params_buffers and not inpt_old.requires_grad:
+                        assert inpt_new is not inpt_old
+                        inpt_old.copy_(inpt_new)
+
         return pytree.tree_map(from_fun, f_outs)
 
     # Kinda annoying, but needed to make sure that the fx graph we trace out has "primals"
@@ -1843,7 +1917,7 @@ def aot_dispatch_base_graph(
         fn_to_trace, flat_args, meta=fw_metadata, aot_config=aot_config, trace_joint=False)
 
     fn_to_trace, updated_flat_args_subclasses_desugared, maybe_subclass_meta = aot_dispatch_subclass(
-        fn_to_trace, updated_flat_args, is_joint_structure=False, meta=fw_metadata, fw_only=flat_fn)
+        fn_to_trace, updated_flat_args, is_joint_structure=False, meta=fw_metadata, fw_only=flat_fn, aot_config=aot_config)
 
     fw_module = create_graph(
         fn_to_trace,
@@ -2323,7 +2397,7 @@ def remove_dupe_metadata(
         subclass_inp_meta=None,
         subclass_fw_graph_out_meta=None,
         subclass_tangent_meta=None,
-        is_train=m.is_train,
+        is_train=m.is_train
     )
 
 # Given our ViewAndMutation metadata, this fn constructs a new set of metadata,
@@ -2374,7 +2448,10 @@ def create_synthetic_base_metadata(
             mutates_data=True if len(outer_indices) > 1 else m.input_info[outer_indices[0]].mutates_data,
             mutates_metadata=False if len(outer_indices) > 1 else m.input_info[outer_indices[0]].mutates_metadata,
             is_leaf=any_leaf,
-            requires_grad=any(m.input_info[x].requires_grad for x in outer_indices)
+            requires_grad=any(m.input_info[x].requires_grad for x in outer_indices),
+            # TODO (is this correct?)
+            input_type=InputType.USER_INPUT,
+
         )
         input_infos.append(inpt_info)
         # requires_grad_info consists of (mutated_inputs, forward_outputs).
@@ -2445,7 +2522,7 @@ def create_synthetic_base_metadata(
         subclass_inp_meta=None,
         subclass_fw_graph_out_meta=None,
         subclass_tangent_meta=None,
-        is_train=m.is_train,
+        is_train=m.is_train
     ), outer_aliased_arg_idx_with_metadata_mutations
 
 # MOTIVATION:
@@ -2668,6 +2745,7 @@ fw_metadata={str(fw_metadata)}
             wrapped_flat_fn,
             keep_input_mutations=fw_metadata.keep_input_mutations,
             is_train=fw_metadata.is_train,
+            num_params_buffers=aot_config.num_params_buffers,
         )(*deduped_flat_args)
         assert ref_fw_metadata == updated_fw_metadata, \
             f'ref_metadata={str(ref_fw_metadata)}, actual_metadata={str(updated_fw_metadata)}'
@@ -2815,6 +2893,7 @@ fw_metadata={str(fw_metadata)}
             wrapped_flat_fn,
             keep_input_mutations=fw_metadata.keep_input_mutations,
             is_train=fw_metadata.is_train,
+            num_params_buffers=aot_config.num_params_buffers,
         )(*flat_args_with_synthetic_bases)
         assert ref_fw_metadata == fw_metadata_updated, (
             f'ref_metadata={pprint.pformat(partial_asdict(ref_fw_metadata))}, '
@@ -2855,10 +2934,11 @@ fw_metadata={str(fw_metadata)}
 
 
 def describe_input(i, aot_config):
-    if i < aot_config.num_params_buffers:
+    params_buffers = aot_config.num_params_buffers
+    if i < params_buffers:
         return f"parameter/buffer {i}"
     else:
-        return f"input {i - aot_config.num_params_buffers}"
+        return f"input {i - params_buffers}"
 
 # The wrapper created by this function handles all of the runtime aliasing and mutation "epilogue" logic
 # that needs to run after the compiled function.
@@ -2909,14 +2989,26 @@ def create_runtime_wrapper(
         num_metadata_mutated_inps = runtime_metadata.num_mutated_metadata_inputs
         num_intermediate_bases = runtime_metadata.num_intermediate_bases
 
+        num_graph_handled = len([i for i in runtime_metadata.input_info if i.input_type == InputType.BUFFER])
+
         if keep_input_mutations:
-            assert (
-                len(all_outs)
-                == num_metadata_mutated_inps + runtime_metadata.num_outputs + num_intermediate_bases
-            )
-            assert (
-                len(runtime_metadata.mutated_inp_runtime_indices) == num_metadata_mutated_inps
-            )
+            if not trace_joint:
+                assert (
+                    len(all_outs)
+                    == num_metadata_mutated_inps + runtime_metadata.num_outputs + num_intermediate_bases
+                )
+                assert (
+                    len(runtime_metadata.mutated_inp_runtime_indices) == num_metadata_mutated_inps
+                )
+            else:
+                assert (
+                    len(all_outs)
+                    == num_mutated_inps + runtime_metadata.num_outputs + num_intermediate_bases
+                )
+                assert (
+                    len(runtime_metadata.mutated_inp_runtime_indices) == num_mutated_inps
+                )
+
         else:
             assert (
                 len(all_outs)
@@ -2925,6 +3017,7 @@ def create_runtime_wrapper(
             assert (
                 len(runtime_metadata.mutated_inp_runtime_indices) == num_mutated_inps
             )
+
         # Step 3: After running the compiled fw, apply updates to mutated inputs
         num_mutations_to_apply = len(runtime_metadata.mutated_inp_runtime_indices)
         if num_mutations_to_apply > 0:
@@ -2992,7 +3085,10 @@ def create_runtime_wrapper(
                     else:
                         original_inpt.copy_(updated_inpt)
         else:
-            fw_outs = all_outs
+            if keep_input_mutations:
+                fw_outs = all_outs
+            else:
+                fw_outs = all_outs
 
         # Step 4: Manually regenerate any outputs that are aliased to inputs, instead of
         # compiling them.
@@ -3006,8 +3102,8 @@ def create_runtime_wrapper(
             else:
                 fw_outs_no_intermediate_bases = fw_outs
                 intermediate_bases = []
-            assert len(fw_outs_no_intermediate_bases) == len(runtime_metadata.output_info)
 
+            assert len(fw_outs_no_intermediate_bases) == len(runtime_metadata.output_info)
             fw_outs_including_aliases = []
             for i, (o, info) in enumerate(zip(
                 fw_outs_no_intermediate_bases, runtime_metadata.output_info
@@ -3328,6 +3424,7 @@ def aot_dispatch_subclass(
     is_joint_structure: bool,
     meta: ViewAndMutationMeta,
     fw_only: Callable,
+    aot_config: AOTConfig,
 ) -> "SubclassTracingInfo":
     # Skip logic if we don't need to trace through any subclasses
     req_subclass_dispatch = requires_subclass_dispatch(args, meta)
@@ -3406,6 +3503,7 @@ def aot_dispatch_subclass(
         metadata_fn,
         keep_input_mutations=meta.keep_input_mutations,
         is_train=meta.is_train,
+        num_params_buffers=aot_config.num_params_buffers,
     )(*primals_unwrapped)
 
     subclass_meta.fw_metadata = meta_updated
@@ -3448,7 +3546,7 @@ def aot_dispatch_autograd_graph(flat_fn, flat_args: List[Any], aot_config: AOTCo
     )
 
     subclass_tracing_info = aot_dispatch_subclass(
-        joint_fn_to_trace, updated_joint_inputs, is_joint_structure=True, meta=fw_metadata, fw_only=flat_fn)
+        joint_fn_to_trace, updated_joint_inputs, is_joint_structure=True, meta=fw_metadata, fw_only=flat_fn, aot_config=aot_config)
 
     joint_fn_to_trace = subclass_tracing_info.plain_tensor_trace_fn
     updated_joint_inputs = subclass_tracing_info.plain_tensor_args
@@ -3457,7 +3555,7 @@ def aot_dispatch_autograd_graph(flat_fn, flat_args: List[Any], aot_config: AOTCo
     fx_g = create_graph(joint_fn_to_trace, updated_joint_inputs, aot_config=aot_config)
 
     # There should be *NO* mutating ops in the graph at this point.
-    assert_functional_graph(fx_g.graph)
+    assert_functional_graph(fx_g.graph, allow_input_mutations=aot_config.keep_inference_input_mutations)
 
     # Redundant with the check above, but worth having in case tracing introduced
     # a fake tensor. Unlikely.
@@ -3784,10 +3882,16 @@ def aot_dispatch_autograd(flat_fn, flat_args: List[Any], aot_config: AOTConfig, 
             # consider marking them as non-differentiable.
             raw_returns_not_including_intermediate_bases = raw_returns[:num_mutated_inputs + num_outputs]
 
-            raw_returns_meta = (
-                [x for x in CompiledFunction.metadata.input_info if x.mutates_data or x.mutates_metadata]
-                + CompiledFunction.metadata.output_info
-            )
+            if CompiledFunction.metadata.keep_input_mutations and CompiledFunction.metadata.is_train:
+                raw_returns_meta = (
+                    [x for x in CompiledFunction.metadata.input_info if (x.mutates_data or x.mutates_metadata) and x.input_type != InputType.BUFFER]
+                    + CompiledFunction.metadata.output_info
+                )
+            else:
+                raw_returns_meta = (
+                    [x for x in CompiledFunction.metadata.input_info if (x.mutates_data or x.mutates_metadata)]
+                    + CompiledFunction.metadata.output_info
+                )
 
             for (i, x) in enumerate(raw_returns_not_including_intermediate_bases):
                 assert CompiledFunction.metadata.requires_grad_info[i] == raw_returns_meta[i].requires_grad
@@ -3991,7 +4095,7 @@ Got grad_output types: {str(grad_output_types)}"""
         runtime_metadata=fw_metadata,
         indices_of_inps_to_detach=_indices_of_inps_to_detach,
         trace_joint=True,
-        keep_input_mutations=False,
+        keep_input_mutations=aot_config.keep_inference_input_mutations,
         disable_amp=disable_amp
     )
 
@@ -4137,8 +4241,10 @@ def create_aot_dispatcher_function(
             with patch("torch.cuda.set_rng_state", lambda *args: None):
                 fw_metadata = run_functionalized_fw_and_collect_metadata(
                     flat_fn,
-                    keep_input_mutations=aot_config.keep_inference_input_mutations and not needs_autograd,
+                    #keep_input_mutations=aot_config.keep_inference_input_mutations and not needs_autograd,
+                    keep_input_mutations=aot_config.keep_inference_input_mutations,
                     is_train=needs_autograd,
+                    num_params_buffers=aot_config.num_params_buffers,
                 )(*fake_flat_args)
 
                 req_subclass_dispatch = requires_subclass_dispatch(fake_flat_args, fw_metadata)
@@ -4157,6 +4263,7 @@ def create_aot_dispatcher_function(
                             flat_fn,
                             keep_input_mutations=aot_config.keep_inference_input_mutations and not needs_autograd,
                             is_train=needs_autograd,
+                            num_params_buffers=aot_config.num_params_buffers,
                         )(*fake_flat_args)
                     else:
                         fw_metadata = ViewAndMutationMeta(
@@ -4236,7 +4343,6 @@ or otherwise set torch._functorch.config.functionalize_rng_ops = False.""")
 
         compiled_fn = compiler_fn(flat_fn, fake_flat_args, aot_config, fw_metadata=fw_metadata)
         if aot_config.is_export:
-
             mutated_user_inp_locs = [
                 idx - aot_config.num_params_buffers
                 for idx in fw_metadata.mutated_inp_indices
@@ -4382,7 +4488,10 @@ def create_graph_signature(
     # Retrieve graph output names
     graph_output_names = _graph_output_names(fx_g)
 
-    num_params_buffers = len(param_names) + len(buffer_names)
+    num_params = len(param_names)
+    num_buffers = len(buffer_names)
+
+    num_params_buffers = num_params + num_buffers
     # We have enough restrictions on the graph (no de-duping, synthetic bases, etc),
     # Such that # graph inps = # user inps + # params + # buffers
     num_user_args = len(graph_input_names) - num_params_buffers
@@ -4575,9 +4684,8 @@ def aot_module(mod: nn.Module, *args, **kwargs) -> nn.Module:
 
     named_params = dict(mod.named_parameters(remove_duplicate=False))
     named_buffers = dict(mod.named_buffers(remove_duplicate=False))
-    num_params_buffers = len(named_params) + len(named_buffers)
     compiled_f = aot_function(
-        functional_call, num_params_buffers=num_params_buffers, *args, **kwargs
+        functional_call, num_params_buffers=len(named_params) + len(named_buffers), *args, **kwargs
     )
 
     class AOTModule(nn.Module):
@@ -4836,7 +4944,7 @@ We require the output marked as the loss (at index {output_loss_index}) to be a 
             fn_to_trace,
             full_args,
             decompositions=decompositions,
-            num_params_buffers=len(params_and_buffers_flat),
+            num_params_buffers=params_len,
             no_tangents=True,
         )
     if trace_joint:
