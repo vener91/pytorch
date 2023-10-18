@@ -233,13 +233,13 @@ test_python_shard() {
     exit 1
   fi
 
-  time python test/run_test.py --exclude-jit-executor --exclude-distributed-tests $INCLUDE_CLAUSE --shard "$1" "$NUM_TEST_SHARDS" --verbose
+  time python test/run_test.py --exclude-jit-executor --exclude-distributed-tests "$INCLUDE_CLAUSE" --shard "$1" "$NUM_TEST_SHARDS" --verbose
 
   assert_git_not_dirty
 }
 
 test_python() {
-  time python test/run_test.py --exclude-jit-executor --exclude-distributed-tests $INCLUDE_CLAUSE --verbose
+  time python test/run_test.py --exclude-jit-executor --exclude-distributed-tests "$INCLUDE_CLAUSE" --verbose
   assert_git_not_dirty
 }
 
@@ -681,7 +681,7 @@ test_vulkan() {
 
 test_distributed() {
   echo "Testing distributed python tests"
-  time python test/run_test.py --distributed-tests --shard "$SHARD_NUMBER" "$NUM_TEST_SHARDS" $INCLUDE_CLAUSE --verbose
+  time python test/run_test.py --distributed-tests --shard "$SHARD_NUMBER" "$NUM_TEST_SHARDS" "$INCLUDE_CLAUSE" --verbose
   assert_git_not_dirty
 
   if [[ ("$BUILD_ENVIRONMENT" == *cuda* || "$BUILD_ENVIRONMENT" == *rocm*) && "$SHARD_NUMBER" == 1 ]]; then
@@ -1094,6 +1094,10 @@ elif [[ "${BUILD_ENVIRONMENT}" == *-mobile-lightweight-dispatch* ]]; then
   test_libtorch
 elif [[ "${TEST_CONFIG}" = docs_test ]]; then
   test_docs_test
+elif [[ "${BUILD_ENVIRONMENT}" == *rocm* && -n "$TESTS_TO_INCLUDE" ]]; then
+  install_torchvision
+  test_python
+  test_aten
 else
   install_torchvision
   install_monkeytype
