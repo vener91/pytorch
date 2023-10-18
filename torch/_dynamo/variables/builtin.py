@@ -1162,7 +1162,6 @@ class BuiltinVariable(VariableTracker):
         elif isinstance(obj, (PythonModuleVariable, DummyModule)):
             # np.typecodes -> tnp.typecodes, both module-level Dict[Str, Str]
             import numpy as np
-
             import torch._numpy as tnp
 
             if obj.value == np and name == "typecodes":
