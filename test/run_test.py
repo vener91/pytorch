@@ -15,7 +15,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from datetime import datetime
-from typing import Any, cast, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, cast, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import pkg_resources
 
@@ -42,6 +42,8 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from tools.stats.export_test_times import TEST_TIMES_FILE
 from tools.stats.upload_metrics import add_global_metric, emit_metric
+
+from tools.testing.execute_test import ExecuteTest
 from tools.testing.target_determination.determinator import (
     AggregatedHeuristics,
     get_test_prioritizations,
@@ -542,6 +544,8 @@ def run_test(
                 is_distributed_test=is_distributed_test,
             )
         )
+        if isinstance(test_module, ShardedTest):
+            unittest_args.extend(test_module.get_pytest_args())
         unittest_args = [arg if arg != "-f" else "-x" for arg in unittest_args]
 
     # TODO: These features are not available for C++ test yet
@@ -1470,7 +1474,7 @@ def get_sharding_opts(options) -> Tuple[int, int]:
 
 def do_sharding(
     options,
-    selected_tests: List[str],
+    selected_tests: Sequence[ExecuteTest],
     test_file_times: Dict[str, float],
     sort_by_time: bool = True,
 ) -> List[ShardedTest]:
@@ -1677,7 +1681,9 @@ def main():
         sharded_tests: List[ShardedTest]
         failures: List[TestFailure]
 
-        def __init__(self, name: str, raw_tests: List[str], should_sort_shard: bool):
+        def __init__(
+            self, name: str, raw_tests: Sequence[ExecuteTest], should_sort_shard: bool
+        ):
             self.name = name
             self.failures = []
             self.sharded_tests = do_sharding(
